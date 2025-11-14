@@ -66,6 +66,19 @@ class Redis
           raise(NotConnected, "Redis::Objects.redis not set to a Redis.new connection")
       end
 
+      # Toggles whether to use the legacy redis key naming scheme, which causes
+      # naming conflicts in certain cases.
+      # (attr_accessor with a default value)
+      attr_writer :prefix_style
+      def prefix_style
+        # NOTE: In a future release the default will change to :modern
+        @prefix_style ||= :legacy
+      end
+
+      def redis_legacy_naming?
+        prefix_style == :legacy
+      end
+
       def included(klass)
         # Core (this file)
         klass.instance_variable_set(:@redis, nil)
@@ -101,11 +114,6 @@ class Redis
         @redis_objects ||= {}
       end
 
-      # Toggles whether to use the legacy redis key naming scheme, which causes
-      # naming conflicts in certain cases.
-      attr_accessor :redis_legacy_naming
-      attr_accessor :redis_silence_warnings
-
       # Set the Redis redis_prefix to use. Defaults to class_name.
       def redis_prefix=(redis_prefix)
         @silence_warnings_as_redis_prefix_was_set_manually = true
@@ -114,10 +122,10 @@ class Redis
 
       def redis_prefix(klass = self) #:nodoc:
         @redis_prefix ||=
-          if redis_legacy_naming
+          if Objects.redis_legacy_naming?
+            redis_legacy_naming_warning_message(klass)
             redis_legacy_prefix(klass)
           else
-            redis_legacy_naming_warning_message(klass)
             redis_modern_prefix(klass)
           end
 
@@ -140,49 +148,76 @@ class Redis
           downcase
       end
 
-        # Temporary warning to help with migrating key names
+      attr_accessor :redis_silence_warnings
+
+      # Temporary warning to help with migrating key names
       def redis_legacy_naming_warning_message(klass)
         # warn @silence_warnings_as_redis_prefix_was_set_manually.inspect
-        unless redis_legacy_naming || redis_silence_warnings || @silence_warnings_as_redis_prefix_was_set_manually
-          modern = redis_modern_prefix(klass)
-          legacy = redis_legacy_prefix(klass)
-          if modern != legacy
-            warn <<EOW
-[redis-objects] WARNING: In redis-objects 2.0.0, key naming will change to fix longstanding bugs.
-[redis-objects] Your class #{klass.name.to_s} will be affected by this change!
+        return if redis_silence_warnings || @silence_warnings_as_redis_prefix_was_set_manually
+
+        modern = redis_modern_prefix(klass)
+        legacy = redis_legacy_prefix(klass)
+        return if modern == legacy
+
+        warn <<EOW
+
+[redis-objects] WARNING: redis-objects 2.0.0, revises key naming to fix a longstanding bug.
+[redis-objects] Your class #{klass.name} should be updated to resolve this bug!
 [redis-objects] Current key prefix: #{legacy.inspect}
 [redis-objects] Future  key prefix: #{modern.inspect}
 [redis-objects] Read more at https://github.com/nateware/redis-objects/issues/231
 EOW
-          end
-        end
       end
 
-      def migrate_redis_legacy_keys
-        cursor = 0
-        legacy = redis_legacy_prefix
-        total_keys = 0
-        if legacy == redis_prefix
-          raise "Failed to migrate keys for #{self.name.to_s} as legacy and new redis_prefix are the same (#{redis_prefix})"
+      # To be run once per Redis::Objects enhanced model
+      def migrate_redis_legacy_keys(scan_count=10, verbose=false)
+        unless Objects.redis_legacy_naming?
+          raise "Redis::Objects is already configured to use modern key prefixes."
         end
-        warn "[redis-objects] Migrating keys from #{legacy} prefix to #{redis_prefix}"
+
+        legacy = redis_legacy_prefix
+        modern = redis_modern_prefix
+        if modern == legacy
+          warn "[redis-objects] #{self.name}.#{__method__} NOOP. Legacy and modern redis_prefix are the same (#{modern})"
+          return
+        end
+
+        warn "\n[redis-objects] Migrating keys from '#{legacy}' prefix to '#{modern}'"
+
+        cursor = 0
+        total_keys = 0
+
+        # Temporarily update the prefix to modern while we update these keys.
+        # NOTE: we cannot simply adjust the prefix_style, because the prefix is cached by @redis_prefix
+        self.redis_prefix = modern
 
         loop do
-          cursor, keys = redis.scan(cursor, :match => "#{legacy}:*")
+          cursor, keys = redis.scan(cursor, :match => "#{legacy}:*", :count => scan_count)
+          # REM: scan returns keys in a randomized order
+          keys.sort!
+          #puts "got #{keys.length} keys"
           total_keys += keys.length
           keys.each do |key|
             # Split key name apart on ':'
-            base_class, id, name = key.split(':')
+            # REM: global keys will have an empty id
+            #      klass::object_accessor_name
+            _base_class, id, name = key.split(':')
 
             # Figure out the new name
-            new_key = redis_field_key(name, id=id, context=self)
+            new_key = redis_field_key(name, id)
 
             # Rename the key
-            warn "[redis-objects] Rename '#{key}', '#{new_key}'"
+            if verbose
+              warn "[redis-objects] Rename '#{key}', '#{new_key}'"
+            end
             ok = redis.rename(key, new_key)
             warn "[redis-objects] Warning: Rename '#{key}', '#{new_key}' failed: #{ok}" if ok != 'OK'
           end
           break if cursor == "0"
+
+        ensure
+          # Change the prefix back (just in case)
+          self.redis_prefix = legacy
         end
 
         warn "[redis-objects] Migrated #{total_keys} total number of redis keys"
@@ -207,18 +242,24 @@ EOW
         klass = first_ancestor_with(name)
         # READ THIS: This can never ever ever ever change or upgrades will corrupt all data
         # I don't think people were using Proc as keys before (that would create a weird key). Should be ok
+        
+        # If a custom key was set for this accessor
         if key = klass.redis_objects[name.to_sym][:key]
+          # If that custom key was callable (E.G. a proc)
           if key.respond_to?(:call)
             key = key.call context
           else
             context.instance_eval "%(#{key})"
           end
+
         else
+          # If its not a global key, and ID is nil, then throw an error
           if id.nil? and !klass.redis_objects[name.to_sym][:global]
             raise NilObjectId,
               "[#{klass.redis_objects[name.to_sym]}] Attempt to address redis-object " +
               ":#{name} on class #{klass.name} with nil id (unsaved record?) [object_id=#{object_id}]"
           end
+          # Otherwise return the constructed key
           "#{redis_prefix(klass)}:#{id}:#{name}"
         end
       end
